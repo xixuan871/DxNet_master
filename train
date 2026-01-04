@@ -1,0 +1,731 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+import numpy as np
+import cv2
+import os
+import glob
+import time
+import sys
+import traceback
+import shutil
+from torchvision import transforms
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+
+from DxNet import DxNet, StrokeRegionCalculation
+
+def print_training(msg):
+    print(msg)
+    sys.stdout.flush()
+
+class FastStrokeDataset(Dataset):
+    def __init__(self, data_dir, transform=None, num_workers=8, preload=False):
+        self.data_dir = data_dir
+        self.transform = transform
+        self.num_workers = num_workers
+        self.preload = preload
+
+        if not os.path.exists(data_dir):
+            raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
+
+        self.image_folders = [f for f in glob.glob(os.path.join(data_dir, "image_*")) if os.path.isdir(f)]
+        self.image_folders.sort()
+        print_training(f"Found {len(self.image_folders)} image folders in {data_dir}")
+
+        self.data = []
+        for i, folder in enumerate(self.image_folders):
+            try:
+                required_files = [
+                    glob.glob(os.path.join(folder, f"*{ext}"))
+                    for ext in ["crossnet_pred.png", "final_processed.png", "union.png", "label.npy"]
+                ]
+                if all(required_files):
+                    self.data.append({
+                        "cross": required_files[0][0],
+                        "non_cross": required_files[1][0],
+                        "original": required_files[2][0],
+                        "label": required_files[3][0]
+                    })
+                    if i < 5 or i % 1000 == 0:
+                        print_training(f"Added sample {i}/{len(self.image_folders)}: {folder}")
+            except Exception as e:
+                print_training(f"Error processing folder {folder}: {e}")
+
+        print_training(f"Data list initialization completed for {data_dir}, number of samples: {len(self.data)}")
+
+        if preload:
+            self._preload_data()
+
+    def _preload_data(self):
+        print_training(f"Starting preloading data paths with {self.num_workers} threads...")
+        start_time = time.time()
+        try:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                self.preloaded_data = list(executor.map(lambda x: self.data[x], range(len(self.data))))
+        except Exception as e:
+            print_training(f"Error preloading data paths: {e}")
+            traceback.print_exc()
+            raise
+        end_time = time.time()
+        print_training(f"Data path preloading completed, {len(self.preloaded_data)} samples in total, time elapsed: {end_time - start_time:.2f}s")
+
+    def __len__(self):
+        return len(self.data) if not self.preload else len(self.preloaded_data)
+
+    def __getitem__(self, idx):
+        if self.preload:
+            return self.preloaded_data[idx]
+        return self.data[idx]
+
+    def _pad_and_reshape_label(self, label):
+        padded_label = np.pad(label, ((4, 4), (4, 4), (0, 0)), mode='constant')
+        return np.transpose(padded_label, (2, 0, 1))
+
+class DxNetTrainer:
+    def __init__(self, args):
+        self.args = args
+        self.best_val_iou = -float('inf')
+        self.best_model_path = os.path.join(args.model_save_dir, "best_model.pth")
+        self.best_vis_dir = os.path.join(args.model_save_dir, "best_visualization/DxNet")
+        self.best_info_path = os.path.join(args.model_save_dir, "best_info.txt")
+        self.start_time = time.time()
+
+        np.random.seed(42)
+        self.colors = np.random.randint(0, 256, size=(10, 3), dtype=np.uint8)
+        print_training(f"Generated 10 random colors for class visualization")
+
+        print_training(f"Trainer initialization started")
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print_training(f"Using device: {self.device}")
+
+        self.class_weights = torch.tensor(
+            [float(w) for w in args.class_weights.split(',')],
+            dtype=torch.float32,
+            device=self.device
+        )
+        assert len(self.class_weights) == 10, f"Number of class weights must be 10, got {len(self.class_weights)}"
+        print_training(f"Class weights: {self.class_weights.cpu().numpy()}")
+
+        self.num_gpus = torch.cuda.device_count()
+        if self.num_gpus > 1:
+            print_training(f"Found {self.num_gpus} GPU devices, will use DataParallel for multi-GPU training")
+        else:
+            print_training(f"Found {self.num_gpus} GPU device, will use single-GPU training")
+
+        os.makedirs(args.model_save_dir, exist_ok=True)
+        print_training(f"Model save directory is ready")
+
+        self.region_calculator = StrokeRegionCalculation(
+            min_region_size=args.min_region_size,
+            enable_timing=False
+        )
+        print_training(f"Region calculation module initialized successfully")
+
+        model_path = args.pretrained_model_path if args.pretrained_model_path != "" else None
+        self.model = DxNet(
+            min_region_size=args.min_region_size,
+            model_path=model_path,
+            enable_timing=False,
+        )
+        print_training(f"Model initialized successfully")
+
+        try:
+            self.model.to(self.device)
+            print_training(f"Model moved to device: {self.device}")
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                for i in range(self.num_gpus):
+                    mem_info = torch.cuda.mem_get_info(i)
+                    print_training(
+                        f"GPU {i} memory info: Available {mem_info[0] / 1024 ** 3:.2f} GB, Total {mem_info[1] / 1024 ** 3:.2f} GB")
+        except Exception as e:
+            print_training(f"Error moving model to device: {e}")
+            raise
+
+        if self.num_gpus > 1:
+            try:
+                self.model = nn.DataParallel(self.model)
+                print_training(f"DataParallel setup completed, will use {self.num_gpus} GPUs")
+            except Exception as e:
+                print_training(f"Error setting up DataParallel: {e}")
+                raise
+
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=args.initial_lr,
+            betas=(0.9, 0.999),
+            weight_decay=1e-4
+        )
+        print_training(f"Optimizer initialized successfully (Adam)")
+
+        self.scheduler = optim.lr_scheduler.StepLR(
+            self.optimizer,
+            step_size=8,
+            gamma=0.5
+        )
+        print_training(f"Learning rate scheduler initialized successfully, time elapsed: {time.time() - self.start_time:.2f}s")
+
+    def iou_loss(self, pred, target, epsilon=1e-6):
+        intersection = (pred * target).sum(dim=(2, 3))
+        union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3)) - intersection
+        iou = (intersection + epsilon) / (union + epsilon)
+
+        per_class_loss = (1 - iou) * self.class_weights
+
+        return per_class_loss.mean(dim=1).mean()
+
+    def weighted_bce_loss(self, pred_logits, target):
+        bce = F.binary_cross_entropy_with_logits(
+            pred_logits,
+            target,
+            reduction='none'
+        )
+
+        weights = self.class_weights.view(1, -1, 1, 1)
+        weighted_bce = bce * weights
+
+        return weighted_bce.mean()
+
+    def prepare_data(self):
+        print_training(f"Starting to prepare data loaders")
+        start_time = time.time()
+
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+
+        train_dataset = FastStrokeDataset(
+            self.args.data_dir,
+            transform=transform,
+            num_workers=self.args.num_workers,
+            preload=True
+        )
+        train_size = len(train_dataset)
+
+        val_dataset = FastStrokeDataset(
+            self.args.val_data_dir,
+            transform=transform,
+            num_workers=self.args.num_workers,
+            preload=True
+        )
+        val_size = len(val_dataset)
+
+        print_training(
+            f"Dataset loading completed, training set size: {train_size}, validation set size: {val_size}, time elapsed: {time.time() - start_time:.2f}s")
+
+        try:
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=self.args.batch_size,
+                shuffle=True,
+                num_workers=self.args.num_workers,
+                pin_memory=True
+            )
+            print_training(
+                f"Training data loader initialized successfully, batch size: {self.args.batch_size}, number of workers: {self.args.num_workers}")
+        except Exception as e:
+            print_training(f"Error initializing training data loader: {e}")
+            raise
+
+        try:
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=self.args.batch_size,
+                shuffle=False,
+                num_workers=self.args.num_workers,
+                pin_memory=True
+            )
+            print_training(
+                f"Validation data loader initialized successfully, batch size: {self.args.batch_size}, number of workers: {self.args.num_workers}")
+        except Exception as e:
+            print_training(f"Error initializing validation data loader: {e}")
+            raise
+
+        print_training(f"Data preparation completed, total time elapsed: {time.time() - start_time:.2f}s")
+        return self.train_loader, self.val_loader
+
+    def process_sample(self, sample):
+        cross_img = cv2.imread(sample["cross"], cv2.IMREAD_GRAYSCALE)
+        non_cross_img = cv2.imread(sample["non_cross"], cv2.IMREAD_GRAYSCALE)
+        original_img = cv2.imread(sample["original"], cv2.IMREAD_GRAYSCALE)
+        label = np.load(sample["label"])
+
+        if cross_img is None:
+            raise ValueError(f"Cannot load image: {sample['cross']}")
+        if non_cross_img is None:
+            raise ValueError(f"Cannot load image: {sample['non_cross']}")
+        if original_img is None:
+            raise ValueError(f"Cannot load image: {sample['original']}")
+
+        _, cross_img = cv2.threshold(cross_img, 127, 255, cv2.THRESH_BINARY)
+        _, non_cross_img = cv2.threshold(non_cross_img, 127, 255, cv2.THRESH_BINARY)
+        _, original_img = cv2.threshold(original_img, 127, 255, cv2.THRESH_BINARY)
+
+        cross_img = cv2.resize(cross_img, (120, 120), interpolation=cv2.INTER_NEAREST)
+        cross_img = np.pad(cross_img, ((4, 4), (4, 4)), mode='constant', constant_values=0)
+
+        non_cross_img = np.pad(non_cross_img, ((4, 4), (4, 4)), mode='constant', constant_values=0)
+        original_img = np.pad(original_img, ((4, 4), (4, 4)), mode='constant', constant_values=0)
+
+        if cross_img.shape != (128, 128):
+            cross_img = cv2.resize(cross_img, (128, 128), interpolation=cv2.INTER_NEAREST)
+        if non_cross_img.shape != (128, 128):
+            non_cross_img = cv2.resize(non_cross_img, (128, 128), interpolation=cv2.INTER_NEAREST)
+        if original_img.shape != (128, 128):
+            original_img = cv2.resize(original_img, (128, 128), interpolation=cv2.INTER_NEAREST)
+
+        cross_tensor = torch.from_numpy(cross_img).float().unsqueeze(0)
+        non_cross_tensor = torch.from_numpy(non_cross_img).float().unsqueeze(0)
+        original_tensor = torch.from_numpy(original_img).float().unsqueeze(0)
+
+        full_regions, _, _ = self.region_calculator.process(
+            cross_tensor,
+            non_cross_tensor,
+            original_tensor
+        )
+        full_regions = full_regions.squeeze(0)
+
+        padded_label = self._pad_and_reshape_label(label)
+        padded_label = torch.from_numpy(padded_label).float()
+
+        original_img = torch.from_numpy(original_img).float().unsqueeze(0) / 255.0
+
+        return full_regions, original_img, padded_label
+
+    def _pad_and_reshape_label(self, label):
+        padded_label = np.pad(label, ((4, 4), (4, 4), (0, 0)), mode='constant')
+        return np.transpose(padded_label, (2, 0, 1))
+
+    def __get_color_image(self, single_image):
+        if isinstance(single_image, torch.Tensor):
+            single_image = single_image.detach().cpu().numpy()
+        C, H, W = single_image.shape
+        color_img = np.zeros((H, W, 3), dtype=np.uint8)
+        for c in range(C):
+            mask = single_image[c] > 0.5
+            color = self.colors[c % len(self.colors)]
+            color_img[mask] = color
+        return color_img
+
+    def visualize_prediction(self, original_img, pred, label, idx, save_dir):
+        pred_prob = torch.sigmoid(pred).cpu().numpy()
+        label_np = label.cpu().numpy()
+        original_np = original_img.squeeze().cpu().numpy()
+
+        original_rgb = cv2.cvtColor((original_np * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        label_color = self.__get_color_image(label_np)
+        pred_color = self.__get_color_image(pred_prob)
+
+        pred_overlay = cv2.addWeighted(original_rgb, 0.6, pred_color, 0.4, 0)
+        label_overlay = cv2.addWeighted(original_rgb, 0.6, label_color, 0.4, 0)
+
+        legend = np.ones((100, 300, 3), dtype=np.uint8) * 255
+        for c in range(min(10, pred_prob.shape[0])):
+            cv2.rectangle(legend, (10, 10 + c * 10), (30, 20 + c * 10), self.colors[c].tolist(), -1)
+            cv2.putText(legend, f"Class {c}", (40, 20 + c * 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 1)
+
+        legend = cv2.resize(legend,
+                            (int(legend.shape[1] * original_rgb.shape[0] / legend.shape[0]), original_rgb.shape[0]))
+
+        combined = np.hstack((original_rgb, label_overlay, pred_overlay, legend))
+        save_path = os.path.join(save_dir, f"sample_{idx}.png")
+        cv2.imwrite(save_path, combined)
+        return save_path
+
+    def save_visualizations(self, num_samples=30):
+        if os.path.exists(self.best_vis_dir):
+            shutil.rmtree(self.best_vis_dir)
+        os.makedirs(self.best_vis_dir, exist_ok=True)
+        print_training(f"Generating visualization results for {num_samples} validation set samples, saving to: {self.best_vis_dir}")
+
+        self.model.eval()
+        with torch.no_grad():
+            indices = np.random.choice(len(self.val_loader.dataset), num_samples, replace=False)
+            for i, idx in enumerate(indices):
+                try:
+                    sample = self.val_loader.dataset[idx]
+                    full_regions, original_img, label = self.process_sample(sample)
+
+                    full_regions_batch = full_regions.unsqueeze(0).to(self.device, non_blocking=True)
+                    original_batch = original_img.unsqueeze(0).to(self.device, non_blocking=True)
+
+                    pred = self.model(full_regions_batch, original_batch)
+                    if isinstance(pred, tuple):
+                        pred = pred[0]
+
+                    self.visualize_prediction(original_img, pred[0], label, i, self.best_vis_dir)
+
+                    if (i + 1) % 10 == 0:
+                        print_training(f"Generated {i + 1}/{num_samples} visualization results")
+                except Exception as e:
+                    print_training(f"Error generating visualization for sample {i}: {e}")
+                    traceback.print_exc()
+                    continue
+
+        print_training(f"Visualization results for {num_samples} validation set samples saved successfully")
+
+    def calculate_iou(self, pred, label, threshold=0.5):
+        pred_mask = (pred > threshold).float()
+        label_mask = label.float()
+
+        intersection = (pred_mask * label_mask).sum(dim=(2, 3))
+        union = (pred_mask + label_mask - pred_mask * label_mask).sum(dim=(2, 3))
+        iou = torch.where(union > 0, intersection / union, torch.zeros_like(intersection))
+
+        has_label = label_mask.sum(dim=(2, 3)) > 0
+
+        per_sample_iou = []
+        for b in range(iou.size(0)):
+            sample_iou = iou[b, has_label[b]]
+            per_sample_iou.append(sample_iou.mean() if len(sample_iou) > 0 else torch.tensor(0.0, device=iou.device))
+
+        mean_iou = torch.stack(per_sample_iou).mean()
+
+        class_iou = []
+        for c in range(iou.size(1)):
+            valid_iou = iou[has_label[:, c], c]
+            class_iou.append(valid_iou.mean().item() if len(valid_iou) > 0 else 0.0)
+
+        return mean_iou, class_iou
+
+    def train(self):
+        print_training(f"Starting training process")
+        start_epoch = 1 if not self.args.continue_training else self.args.start_epoch
+        print_training(f"Initial epoch: {start_epoch}")
+
+        total_epochs = self.args.epochs if not self.args.continue_training else self.args.start_epoch + self.args.num_epochs - 1
+        print_training(f"Total training epochs: {total_epochs}")
+
+        for epoch in range(start_epoch, total_epochs + 1):
+            epoch_start = time.time()
+            print_training(f"Epoch {epoch}/{total_epochs} started")
+
+            current_lr = self.optimizer.param_groups[0]['lr']
+            print_training(f"Current learning rate: {current_lr:.8f}")
+            print_training(f"=" * 50)
+
+            self.model.train()
+            train_loss = 0.0
+            train_bce_loss = 0.0
+            train_iou_loss = 0.0
+            train_mean_iou = 0.0
+            train_class_iou = [0.0] * 10
+            batch_count = len(self.train_loader)
+            print_training(f"Training phase started, number of batches: {batch_count}")
+
+            for batch_idx, batch in enumerate(self.train_loader):
+                batch_start = time.time()
+
+                try:
+                    full_regions_list = []
+                    original_list = []
+                    labels_list = []
+                    for i in range(len(batch["cross"])):
+                        sample = {
+                            "cross": batch["cross"][i],
+                            "non_cross": batch["non_cross"][i],
+                            "original": batch["original"][i],
+                            "label": batch["label"][i]
+                        }
+                        full_regions, original_img, label = self.process_sample(sample)
+                        full_regions_list.append(full_regions)
+                        original_list.append(original_img)
+                        labels_list.append(label)
+
+                    full_regions_batch = torch.stack(full_regions_list).to(self.device, non_blocking=True)
+                    original_batch = torch.stack(original_list).to(self.device, non_blocking=True)
+                    label_batch = torch.stack(labels_list).to(self.device, non_blocking=True)
+                except Exception as e:
+                    print_training(f"Error processing images: {e}")
+                    traceback.print_exc()
+                    raise
+
+                self.optimizer.zero_grad()
+
+                try:
+                    dxnet_out = self.model(full_regions_batch, original_batch)
+                    if isinstance(dxnet_out, tuple):
+                        dxnet_out = dxnet_out[0]
+
+                    min_batch = min(dxnet_out.size(0), label_batch.size(0))
+                    dxnet_out = dxnet_out[:min_batch]
+                    label_batch = label_batch[:min_batch]
+
+                    pred_prob = torch.sigmoid(dxnet_out)
+
+                    bce_loss = self.weighted_bce_loss(dxnet_out, label_batch)
+                    iou_loss_val = self.iou_loss(pred_prob, label_batch)
+                    weighted_iou_loss = iou_loss_val.item() * self.args.iou_loss_weight
+                    loss = bce_loss + self.args.iou_loss_weight * iou_loss_val
+
+                    mean_iou, class_iou = self.calculate_iou(pred_prob, label_batch)
+                except Exception as e:
+                    print_training(f"Error in forward propagation: {e}")
+                    traceback.print_exc()
+                    raise
+
+                try:
+                    loss.backward()
+                    self.optimizer.step()
+                except Exception as e:
+                    print_training(f"Error in backward propagation: {e}")
+                    traceback.print_exc()
+                    raise
+
+                train_loss += loss.item()
+                train_bce_loss += bce_loss.item()
+                train_iou_loss += weighted_iou_loss
+                train_mean_iou += mean_iou.item()
+                for c in range(len(class_iou)):
+                    if c < len(train_class_iou):
+                        train_class_iou[c] += class_iou[c]
+
+                batch_time = time.time() - batch_start
+                if batch_idx % 10 == 0 or batch_idx == batch_count - 1:
+                    print_training(
+                        f"[Training] Batch {batch_idx + 1}/{batch_count} - "
+                        f"Total Loss: {loss.item():.6f} - "
+                        f"Weighted BCE Loss: {bce_loss.item():.6f} - "
+                        f"Weighted IoU Loss: {weighted_iou_loss:.6f} - "
+                        f"Mean IoU: {mean_iou.item():.6f} - "
+                        f"Learning Rate: {current_lr:.8f} - Time Elapsed: {batch_time:.4f}s"
+                    )
+
+            self.scheduler.step()
+
+            train_loss /= batch_count
+            train_bce_loss /= batch_count
+            train_iou_loss /= batch_count
+            train_mean_iou /= batch_count
+            for c in range(len(train_class_iou)):
+                train_class_iou[c] /= batch_count
+
+            print_training(
+                f"Training phase completed, Average Total Loss: {train_loss:.6f}, "
+                f"Weighted BCE Loss: {train_bce_loss:.6f}, "
+                f"Weighted IoU Loss: {train_iou_loss:.6f}, "
+                f"Mean IoU: {train_mean_iou:.6f}"
+            )
+
+            print_training("\nTraining Class IoU:")
+            print_training("  Class | IoU Value")
+            print_training("-" * 20)
+            for c in range(len(train_class_iou)):
+                print_training(f"  {c:2d}   |  {train_class_iou[c]:.6f}")
+            print_training("-" * 20)
+
+            self.model.eval()
+            val_loss = 0.0
+            val_bce_loss = 0.0
+            val_iou_loss = 0.0
+            val_mean_iou = 0.0
+            val_class_iou = [0.0] * len(train_class_iou)
+            val_batch_count = len(self.val_loader)
+            print_training(f"Validation phase started, number of batches: {val_batch_count}")
+
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(self.val_loader):
+                    batch_start = time.time()
+
+                    try:
+                        full_regions_list = []
+                        original_list = []
+                        labels_list = []
+                        for i in range(len(batch["cross"])):
+                            sample = {
+                                "cross": batch["cross"][i],
+                                "non_cross": batch["non_cross"][i],
+                                "original": batch["original"][i],
+                                "label": batch["label"][i]
+                            }
+                            full_regions, original_img, label = self.process_sample(sample)
+                            full_regions_list.append(full_regions)
+                            original_list.append(original_img)
+                            labels_list.append(label)
+
+                        full_regions_batch = torch.stack(full_regions_list).to(self.device, non_blocking=True)
+                        original_batch = torch.stack(original_list).to(self.device, non_blocking=True)
+                        label_batch = torch.stack(labels_list).to(self.device, non_blocking=True)
+                    except Exception as e:
+                        print_training(f"Error processing validation images: {e}")
+                        traceback.print_exc()
+                        raise
+
+                    try:
+                        dxnet_out = self.model(full_regions_batch, original_batch)
+                        if isinstance(dxnet_out, tuple):
+                            dxnet_out = dxnet_out[0]
+
+                        min_batch = min(dxnet_out.size(0), label_batch.size(0))
+                        dxnet_out = dxnet_out[:min_batch]
+                        label_batch = label_batch[:min_batch]
+
+                        pred_prob = torch.sigmoid(dxnet_out)
+
+                        bce_loss_val = self.weighted_bce_loss(dxnet_out, label_batch)
+                        iou_loss_val = self.iou_loss(pred_prob, label_batch)
+                        weighted_iou_loss_val = iou_loss_val.item() * self.args.iou_loss_weight
+                        total_loss_val = bce_loss_val + self.args.iou_loss_weight * iou_loss_val
+
+                        mean_iou, class_iou = self.calculate_iou(pred_prob, label_batch)
+                    except Exception as e:
+                        print_training(f"Error in validation forward propagation: {e}")
+                        traceback.print_exc()
+                        raise
+
+                    val_loss += total_loss_val.item()
+                    val_bce_loss += bce_loss_val.item()
+                    val_iou_loss += weighted_iou_loss_val
+                    val_mean_iou += mean_iou.item()
+                    for c in range(len(class_iou)):
+                        if c < len(val_class_iou):
+                            val_class_iou[c] += class_iou[c]
+
+                    batch_time = time.time() - batch_start
+                    if batch_idx % 10 == 0 or batch_idx == val_batch_count - 1:
+                        print_training(
+                            f"[Validation] Batch {batch_idx + 1}/{val_batch_count} - "
+                            f"Total Loss: {total_loss_val.item():.6f} - "
+                            f"Weighted BCE Loss: {bce_loss_val.item():.6f} - "
+                            f"Weighted IoU Loss: {weighted_iou_loss_val:.6f} - "
+                            f"Mean IoU: {mean_iou.item():.6f} - Time Elapsed: {batch_time:.4f}s"
+                        )
+
+            val_loss /= val_batch_count
+            val_bce_loss /= val_batch_count
+            val_iou_loss /= val_batch_count
+            val_mean_iou /= val_batch_count
+            for c in range(len(val_class_iou)):
+                val_class_iou[c] /= val_batch_count
+
+            print_training(
+                f"Validation phase completed, Average Total Loss: {val_loss:.6f}, "
+                f"Weighted BCE Loss: {val_bce_loss:.6f}, "
+                f"Weighted IoU Loss: {val_iou_loss:.6f}, "
+                f"Mean IoU: {val_mean_iou:.6f}"
+            )
+
+            print_training("\nValidation Class IoU:")
+            print_training("  Class | IoU Value")
+            print_training("-" * 20)
+            for c in range(len(val_class_iou)):
+                print_training(f"  {c:2d}   |  {val_class_iou[c]:.6f}")
+            print_training("-" * 20)
+
+            epoch_time = time.time() - epoch_start
+            print_training(f"=" * 50)
+            print_training(f"Epoch {epoch}/{total_epochs} Summary:")
+            print_training(
+                f"  Training Total Loss: {train_loss:.6f}, Weighted BCE: {train_bce_loss:.6f}, Weighted IoU Loss: {train_iou_loss:.6f}, "
+                f"Training IoU: {train_mean_iou:.6f}"
+            )
+            print_training(
+                f"  Validation Total Loss: {val_loss:.6f}, Weighted BCE: {val_bce_loss:.6f}, Weighted IoU Loss: {val_iou_loss:.6f}, "
+                f"Validation IoU: {val_mean_iou:.6f}"
+            )
+            print_training(f"  Current Learning Rate: {current_lr:.8f}, Epoch Time Elapsed: {epoch_time:.2f}s")
+            print_training(f"=" * 50)
+
+            is_best = val_mean_iou > self.best_val_iou
+            if is_best:
+                self.best_val_iou = val_mean_iou
+                self.save_model(epoch, val_loss, val_mean_iou)
+                self.save_visualizations()
+                self.save_best_info(epoch, val_loss, val_mean_iou)
+
+        print_training(f"Training completed, total time elapsed: {time.time() - self.start_time:.2f}s")
+        print_training(f"Best Validation IoU: {self.best_val_iou:.6f}")
+        print_training(f"Best Model Path: {self.best_model_path}")
+        print_training(f"Best Visualization Path: {self.best_vis_dir}")
+
+    def save_model(self, epoch, val_loss, val_iou):
+        try:
+            model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
+            torch.save(model_to_save.state_dict(), self.best_model_path)
+            print_training(f"Best model saved: {self.best_model_path} (Epoch: {epoch}, IoU: {val_iou:.6f})")
+        except Exception as e:
+            print_training(f"Error saving model: {e}")
+            raise
+
+    def save_best_info(self, epoch, val_loss, val_iou):
+        with open(self.best_info_path, 'w') as f:
+            f.write(f"Best Model Information:\n")
+            f.write(f"Epoch: {epoch}\n")
+            f.write(f"Validation Total Loss: {val_loss:.6f}\n")
+            f.write(f"Validation Mean IoU: {val_iou:.6f}\n")
+            f.write(f"IoU Loss Weight: {self.args.iou_loss_weight}\n")
+            f.write(f"Class Weights: {self.class_weights.cpu().numpy()}\n")
+            f.write(f"Save Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        print_training(f"Best model information saved to: {self.best_info_path}")
+
+def main():
+    parser = argparse.ArgumentParser(description='DxNet Training Script (Loss Function with Class Weights)')
+
+    parser.add_argument('--data_dir', type=str,
+                        default="/home/wdxy/exp/dataset/strock_semantics/semantics_kai/semantics_train",
+                        help='Training set directory path')
+    parser.add_argument('--val_data_dir', type=str,
+                        default="/home/wdxy/exp/dataset/strock_semantics/semantics_kai/semantics_test",
+                        help='Validation set directory path')
+    parser.add_argument('--batch_size', type=int, default=18, help='Batch size')
+    parser.add_argument('--num_workers', type=int, default=32, help='Number of data loading threads')
+
+    parser.add_argument('--epochs', type=int, default=40, help='Total training epochs (from scratch)')
+    parser.add_argument('--initial_lr', type=float, default=0.001, help='Initial learning rate')
+    parser.add_argument('--iou_loss_weight', type=float, default=0.1,
+                        help='Weight coefficient for IoU loss')
+    parser.add_argument('--class_weights', type=str,
+                        default="1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0",
+                        help='Weights for 10 classes, separated by commas, e.g., "1.0,1.0,...,1.0"')
+
+    parser.add_argument('--model_save_dir', type=str, default="/home/wdxy/exp/test", help='Model save directory')
+    parser.add_argument('--min_region_size', type=int, default=8, help='Minimum region size')
+
+    parser.add_argument('--gpu_ids', type=str, default="0,1", help='GPU IDs to use')
+
+    parser.add_argument('--continue_training', action='store_true', default=False, help='Whether to continue training')
+    parser.add_argument('--pretrained_model_path', type=str, default="", help='Pretrained model path')
+    parser.add_argument('--start_epoch', type=int, default=0, help='Starting epoch for continued training')
+    parser.add_argument('--num_epochs', type=int, default=0, help='Number of epochs for continued training')
+
+    args = parser.parse_args()
+
+    if not os.path.exists(args.val_data_dir):
+        raise ValueError(f"Validation set directory does not exist: {args.val_data_dir}")
+    if args.continue_training and args.pretrained_model_path == "":
+        raise ValueError("Must specify --pretrained_model_path when using --continue_training")
+    if args.start_epoch < 1:
+        print_training("Warning: start_epoch is less than 1, will use default value 1")
+        args.start_epoch = 1
+    if len(args.class_weights.split(',')) != 10:
+        raise ValueError(f"Class weights must contain 10 values, got {len(args.class_weights.split(','))}")
+
+    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_ids
+
+    print_training(f"Starting multi-GPU training, GPU IDs: {args.gpu_ids}")
+    print_training(f"IoU Loss Weight: {args.iou_loss_weight}")
+    print_training(f"Class Weights: {args.class_weights}")
+
+    try:
+        trainer = DxNetTrainer(args)
+        train_loader, val_loader = trainer.prepare_data()
+        trainer.train()
+    except Exception as e:
+        print_training(f"Training error: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    print_training(f"Program started")
+    print_training(f"Python Version: {sys.version.split()[0]}")
+    print_training(f"PyTorch Version: {torch.__version__}")
+    print_training(f"CUDA Version: {torch.version.cuda}")
+
+    main()
